@@ -1,25 +1,34 @@
 {-# LANGUAGE Rank2Types #-}
 {-# OPTIONS_GHC -fno-monomorphism-restriction #-}
-import Prelude hiding ( Enum )
---import Control.Enumerator.Base where
-{-
-type IterateeM acc a m = acc -> a -> m (IterResult acc)
-newtype EnumeratorM m a =
-    EnumM { enum :: forall acc. IterateeM acc a m -> acc -> m acc }
 
+import Debug.Trace
+
+type IterateeM a m r = r -> a -> m (Either r r)
+newtype EnumeratorM m a =
+    EnumM { enum :: forall r. IterateeM a m r -> r -> m r }
+
+mkEnum :: (forall r. IterateeM a m r -> r -> m r) -> EnumeratorM m a
 mkEnum = EnumM
 
-data IterResult a 
-    = IOk a
-    | IStop a
-
 instance Functor (EnumeratorM m) where
-    -- fmap :: (a -> b) -> EnumeratorM m a -> EnumeratorM m b
-    --       = forall r. IterateeM r a m -> r -> m r
-    --         -> forall r. IterateeM r b m -> r -> m r
     fmap f (EnumM enuma) = mkEnum $ \iter r ->
                             let iter' r' a = iter r' (f a) in
                             enuma iter' r
+
+------------------------------------------------------------------------
+
+stringEnum :: Monad m => String -> Int -> EnumeratorM m String
+stringEnum str chunksize = mkEnum e 
+  where
+    e iter a = go a str
+      where
+        go a [] = return a
+        go a s = do
+          let (d,s') = splitAt chunksize s
+          r <- iter a d
+          case r of
+            Right a' -> go a' s'
+            Left a'  -> return a'
 
 -- | Concatenate two enumerators yields a new enumerator that generates the
 --  output from the first enumerator, then the output from the second
@@ -38,55 +47,120 @@ concatE enum1 enum2 = mkEnum $ e
         k (False, seed) = return seed
         k (True, seed) = enum enum2 iter seed
 
-stringEnum :: Monad m => String -> Int -> EnumeratorM m String
-stringEnum str chunksize = mkEnum e 
-  where
-    e iter a = go a str
-      where
-        go a [] = return a
-        go a s = do
-          let (d,s') = splitAt chunksize s
-          r <- iter a d
-          case r of
-            IOk a'   -> go a' s'
-            IStop a' -> return a'
 
-printIter :: Show a => IterateeM () a IO
-printIter _ a = print a >> return (IOk ())
+------------------------------------------------------------------------
+-- Parser stuff
+-- 
+-- TODO: move into separate file
+-- TODO: implement look-ahead (at least a single symbol)
 
-countIter :: Monad m => IterateeM Int a m
-countIter n _ = return (IOk $! n + 1)
+newtype P s a = MkP { runP :: forall b. (a -> P' s b) -> P' s b }
+data P' s a 
+  = SymbolBind (s -> P' s a)
+  | Fail'
+  | ReturnPlus a (P' s a)
 
---lEnum :: Monad m => EnumeratorM m String -> EnumeratorM m Int
-lEnum enumstr = mkEnum e
-  where
-    e iter a = enum enumstr iter' a
-      where
-        iter' a str = iter a (length str)
-  
+infixr 8 +++
 
-forE :: EnumeratorM m dat -> a -> IterateeM a dat m -> m a
-forE e a i = enum e i a
+instance Monad (P s) where
+  return  = succeed
+  p >>= f = pbind p f
+  fail _  = pfail
 
-t001 = forE (concatE (stringEnum "foobarbaz" 5)
-                     (stringEnum "axonos" 2)) () $
-            printIter
-t002 = (forE (concatE (stringEnum "foobarbaz" 1)
-                      (stringEnum "axonos" 2)) 0 $
-            countIter)
-       >>= print
+symbol :: P s s
+symbol     = MkP $ \k -> SymbolBind k
 
-t003 = forE ((\x -> (x,x)) `fmap` 
-                   concatE (stringEnum "foobarbaz" 5)
-                           (stringEnum "axonos" 2)) () $
-            printIter
+pfail  :: P s a
+pfail      = MkP $ \k -> Fail'
 
-thenI :: IterateeM acc1 a m -> (acc1 -> a -> IterateeM acc2 a m) 
-      -> IterateeM acc2 a m
-thenI _ _ = undefined
--}
+(+++) :: P s a -> P s a -> P s a
+p +++ q    = MkP $ \k -> runP p k `choice` runP q k
+
+succeed :: a -> P s a
+succeed x  = MkP $ \k -> k x
+
+pbind :: P s a -> (a -> P s b) -> P s b
+pbind p f  = MkP $ \k -> runP p (\x -> runP (f x) k)
+
+choice (SymbolBind f)    (SymbolBind g)    = SymbolBind (\c -> f c `choice` g c)
+choice Fail'             q                 = q
+choice p                 Fail'             = p
+choice (ReturnPlus x p)  q                 = ReturnPlus x (p `choice` q)
+choice p                 (ReturnPlus x q)  = ReturnPlus x (p `choice` q)
+
+-----
+
+parse p    = parse' (runP p (\x -> ReturnPlus x Fail'))
+
+parse' (SymbolBind f)    (c : s)  = parse' (f c) s
+parse' (ReturnPlus x p)  s        = (x, s) : parse' p s
+parse' _                 _        = []
+
+-----
+
+satisfy :: (s -> Bool) -> P s s
+satisfy p = do s <- symbol
+               if p s then return s
+                      else pfail
+
+char :: Char -> P Char Char
+char c = satisfy (==c)
+
+literal :: String -> P Char String
+literal s = l' s
+  where l' [] = return s
+        l' (c:cs) = char c >> l' cs
+
+space :: P Char ()
+space = char ' ' >> return ()
+
+p001 = literal "foobar"
+
 ------------------------------------------------------------------------
 
+parseFullE' :: (Monad m, Show a, Show s) => 
+               P s a -> EnumeratorM m [s]
+            -> m (Maybe [a])
+parseFullE' p e = do
+  let p' = runP p (\x -> ReturnPlus x Fail')
+  let iter = pFullIter
+  (_, r) <- enum e iter (p', Nothing)
+  return r
+
+pFullIter :: (Monad m, Show a, Show s) =>
+             IterateeM [s] m (P' s a, Maybe [a])
+pFullIter (p0, a0) s0 = go p0 a0 s0
+  where
+    go (SymbolBind f) a (c : s) = 
+        trace (show ("go_bind", a, c, s)) $
+        go (f c) Nothing s
+    go p@(SymbolBind _) a [] =
+        trace (show ("go_eoc", a)) $
+        return (Right (p, a))
+    go (ReturnPlus x p) a s =
+        trace (show ("go_return", x, s)) $ 
+        -- ok, we have *some* output, dependening on whether we hit eof or not
+        go p (addResult x a) s
+    go p@Fail' a [] = 
+        trace (show ("go_fail_eoc", a)) $ 
+        return (Right (p, a))
+    go p@Fail' a s  = 
+        trace (show ("go_fail", a, s)) $
+        return (Left (p, Nothing))
+ 
+    addResult x Nothing   = Just [x]
+    addResult x (Just xs) = Just (x:xs)
+
+t010 = do p <- parseFullE' p001 (stringEnum "foobar" 2)
+          print p
+
+p002 = (symbol >> return 1) +++ (char 'a' >> return 2)
+
+t011 = do p <- parseFullE' p002 (stringEnum "a" 2)
+          print p
+
+------------------------------------------------------------------------
+{-
 -- Iterator returns a continuation.  This can be a more convenient way to
 -- change state.
 --
@@ -148,29 +222,4 @@ twiceI act = it1
     it1' r a = act a >> return (Right ((), it2))
     it2 = Iter i21'
     i21' r a = act a >> return (Left ())
-
-t001 = runE (strEnum "foobarbaz" 3) () prIter
-t002 = runE (strEnum "foobarbaz" 3) () iToggle
-t003 = runE (strEnum "foobarbazmoo" 3) ()
-            (twiceI print `thenI` onceI (print . length))
-
--- Iterators that return a result and possibly the unconsumed input.
--- INVARIANT: Right ((_, s),_) ==> s == ""
---            (i.e. "gimme more" implies no unconsumed input)
---
-type Chunky m r = Iter String m (r, String)
-{-
-thenC :: Monad m => Chunky m r -> Chunky m r -> Chunky m r
-thenC i1 i2 = it
-  where
-    it = Iter it'
-    it' (r, rest) str = do
-      ir1 <- runIter i1 (r, rest)
-      case ir1 of
-        Right (r', i1') -> do
-          ir1' <- runIter i1' r' str
-          case ir1' of
-            Right (r'', i1'') ->
-        Left (r', rest') ->
-            ir2 <- runIter i2 (r', rest')
 -}
