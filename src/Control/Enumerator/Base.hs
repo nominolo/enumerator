@@ -227,6 +227,7 @@ data P' s a
   = SymbolBind (s -> P' s a)
   | Fail'
   | ReturnPlus a (P' s a)
+  | LookBind Int ([s] -> P' s a)
 
 infixr 8 +++
 
@@ -307,42 +308,46 @@ parseI_first' p = Iter (go p)
         return (Left Nothing)
 
 -- | Only succeeds if it finds a parse for the full input.
-parseFullE :: (Monad m, Show a, Show s) => P s a -> Enum m [s] -> m (Maybe a)
+parseFullE :: (Monad m, Show a, Show s) => P s a -> Enum m [s] -> m [a]
 parseFullE p (Enum enum) = do 
   r <- enum (parseI_tillEof p) NoRslt
   case r of
-    RsltIfEof a -> return (Just a)
-    _           -> return Nothing
+    RsltIfEof as -> return as
+    _           -> return []
 
 parseI_tillEof :: 
     ( Monad m
     , Show a, Show s
-    )=> P s a -> Iter [s] m (EofSt a)
+    )=> P s a -> Iter [s] m (EofSt [a])
 parseI_tillEof p = parseI_tillEof' (runP p (\x -> ReturnPlus x Fail'))
 
 data EofSt a = NoRslt | RsltIfEof a deriving Show
+addRslt :: a -> EofSt [a] -> EofSt [a]
+addRslt x NoRslt = RsltIfEof [x]
+addRslt x (RsltIfEof xs) = RsltIfEof (x:xs)
 
 parseI_tillEof' :: 
     ( Monad m
     , Show a, Show s
-    ) => P' s a -> Iter [s] m (EofSt a)
+    ) => P' s a -> Iter [s] m (EofSt [a])
 parseI_tillEof' p = Iter (go p)
   where
+    nada = NoRslt
     -- no input left in current chunk
     -- some input left
     go (SymbolBind f)   a (c : s)  = trace (show ("go_bind", a, c, s)) $
         -- if we had some parse result, we don't have anymore, since
         -- we only want the output right before EOF
-        go (f c) NoRslt s
+        go (f c) nada s
     go p@(SymbolBind _) a [] = 
         trace (show ("go_eoc", a)) $
         return (Right (a, parseI_tillEof' p))
     go (ReturnPlus x p) a s = trace (show ("go_return", x, s)) $ 
         -- ok, we have *some* output, dependening on whether we hit eof or not
-        go p (RsltIfEof x) s
+        go p (addRslt x a) s
     go p@Fail' a [] = trace (show ("go_fail_eoc", a)) $ 
                       return (Right (a, parseI_tillEof' p))
-    go Fail' a s  = trace (show ("go_fail", a, s)) $ return (Left NoRslt)
+    go Fail' a s  = trace (show ("go_fail", a, s)) $ return (Left nada)
    
 
 tp001 = do p <- runE (strEnum "foobarbaz" 2) Nothing (parseI_first p001)
@@ -352,4 +357,12 @@ tp002 = do p <- parseFullE p001 (strEnum "foobar" 2)
            print p
 
 tp003 = do p <- parseFullE p001 (strEnum "foobarz" 2)
+           print p
+
+p002 = (symbol >> return 1) +++ (char 'a' >> return 2)
+
+tp004 = do p <- parseFullE p002 (strEnum "z" 2)
+           print p
+
+tp005 = do p <- parseFullE p002 (strEnum "a" 2)
            print p
